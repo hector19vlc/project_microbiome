@@ -1,0 +1,621 @@
+---
+title: "PLS-DA model - Cirrhosis disease"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+In this appendix we will analyze the results of the different PLS-DA applied to the 4 pre-processed cirrhosis disease. The procedure used is the same for all 4 preprocessing processes, so we will explain it only for the first one. The purpose of this annex is not only to explain the procedure, but also to show the results obtained and compare them with each other.
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+```
+
+
+```{r message=FALSE, include=FALSE}
+library(phyloseq)
+
+setwd(".")
+
+library(DataExplorer)
+library(rmarkdown)
+library(dplyr)
+library(FactoMineR)
+library(factoextra)
+library(ropls)
+library(pls)
+library(caret)
+library(ROCR)
+library(MLmetrics)
+library(vip)
+library(plotly)
+```
+
+# Load the data
+
+We will divide the corpus of each of the preprocessed data into training and test, leaving 80% of the data for training and the remaining 20% for the test. The data will be scaled, and a numerical transformation will be applied to the TSS preprocessing (for both S1 and S2 normalizations).
+
+```{r}
+sample = as.data.frame(Datos_sample$Cirrosis)
+a = factor(sample$cirrhotic, levels=c("n","y"),labels=c("healthy","ill"))
+
+#S1 Normalization
+
+tss1 = as.data.frame(log(as.data.frame(t(DatosFinal$Cirrosis$S1_NORMAL$S1_TSS_CIRR)) * 10e6 + 1))
+clr1 = as.data.frame(t(DatosFinal$Cirrosis$S1_NORMAL$S1_CLR_CIRR))
+tss1 = as.data.frame(scale(tss1))
+clr1 = as.data.frame(scale(clr1))
+clr1$disease = a
+tss1$disease = a
+
+set.seed(110)
+filas.tss1 = createDataPartition(tss1$disease, p=0.8, list=FALSE)
+filas.clr1 = createDataPartition(clr1$disease, p=0.8, list=FALSE)
+clr1Train = clr1[filas.clr1,]
+clr1Test = clr1[-filas.clr1,]
+tss1Train =tss1[filas.tss1,]
+tss1Test = tss1[-filas.tss1,]
+
+#S2 Normalization
+
+tss = as.data.frame(log(as.data.frame(t(DatosFinal$Cirrosis$S2_NORMAL$S2_TSS_CIRR)) * 10e6 + 1))
+clr = as.data.frame(t(DatosFinal$Cirrosis$S2_NORMAL$S2_CLR_CIRR))
+
+tss = as.data.frame(scale(tss))
+clr = as.data.frame(scale(clr))
+clr$disease = a
+tss$disease = a
+
+filas.tss = createDataPartition(tss$disease, p=0.8, list=FALSE)
+filas.clr = createDataPartition(clr$disease, p=0.8, list=FALSE)
+clrTrain = clr[filas.clr,]
+clrTest = clr[-filas.clr,]
+tssTrain =tss[filas.tss,]
+tssTest = tss[-filas.tss,]
+```
+
+# S1 Filter Process
+
+## CLR
+
+As mentioned in the report, we start by training a PLS-DA model with all the species we have in this dataset, which for s1 are 530. We will limit the principal components of this model to 2. For this model we will obtain the AUC and the f1-score, which will help us, in addition to assessing the quality of the model, to compare it with other subsequent models.
+
+```{r}
+plsclr = plsda(x=select(clr1Train,-disease), y=clr1Train$disease, ncomp = 2, type="prob", probMethod = "softmax")
+
+pred = predict(plsclr, newdata=select(clr1Test,-disease), type="prob")
+pred = as.data.frame(pred)
+prediction = prediction(pred$ill,as.numeric(clr1Test$disease)-1)
+perf <- performance(prediction,"tpr","fpr")
+perf2 = performance(prediction,"auc")
+auc = as.numeric(perf2@y.values)
+plot(perf,colorize=TRUE)
+abline(a = 0, b = 1)
+text(0.6, 0.3, label = paste0("AUC ",round(auc,3)))
+
+pred2 = predict(plsclr, newdata=select(clr1Test,-disease))
+F1_Score(clr1Test$disease, pred2)
+```
+
+
+Now we are going to train different models with different VIP cuts (procedure explained in the report). To evaluate them, we will only take into account their AUC. For this corpus, we will go through all the vips 15 at a time.
+
+
+```{r}
+resultados = data.frame()
+
+plsprobs = plsda(x=select(clr1Train,-disease), y=clr1Train$disease, type="prob", probMethod = "softmax")
+
+g = vip(plsprobs, num_features = 530)
+v = g$data$Variable
+
+for (i in seq(15,530,15)) {
+  otus = v[1:i]
+  newdata = as.data.frame(clr1Train[otus])
+  newdata$disease = clr1Train$disease
+  
+  #train the models with 10 fold cv with the selected variables based on the auc and take the best one.
+  tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+  model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+  c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+  
+  
+  #train the one that gives the best result with the whole set of train and predict the test set. Save the results obtained
+  plsprobs = plsda(x=select(newdata,-disease), y=newdata$disease, ncomp = c, type="prob", probMethod = "softmax")
+  pred = predict(plsprobs, newdata=clr1Test[otus], type="prob")
+  pred = as.data.frame(pred)
+  colnames(pred) = c("healthy","ill")
+  prediction = prediction(pred$ill,clr1Test$disease)
+  perf = performance(prediction,"auc")
+  resultados = rbind(resultados, data.frame(importantOtus=i,ncomp=c,auc=as.numeric(perf@y.values)))
+
+
+}
+
+print(resultados)
+```
+
+The model with the best auc this time is with 450 variables. Let's analyze this model in depth.
+
+```{r}
+pls450 = plsda(x=clr1Train[v[1:450]], y=clr1Train$disease, ncomp = 2, type="class", probMethod = "softmax")
+
+pred = predict(pls450, newdata=clr1Test[v[1:450]], type="prob")
+pred = as.data.frame(pred)
+
+pred2 <- predict(pls450, newdata = clr1Test[v[1:450]])
+f1 <- F1_Score(clr1Test$disease, pred2)
+print(f1)
+```
+
+The f1-score value (0.933) has also increased with respect to the model with all variables (0.909).
+We plot the score graph, which will help us to see how the model separates individuals according to their class.
+
+```{r}
+scores = pls450$scores
+scores = data.frame("p1"=scores[,1],
+                    "p2"=scores[,2],
+                    "type"=clr1Train$disease)
+g1 = ggplot(scores, aes(p1,p2, color=type)) + geom_point(alpha = I(0.6)) + 
+     scale_color_manual(values = c("blue", "red"))
+g1
+```
+
+As already indicated by the AUC and f1-score values, the model clearly separates individuals with cirrhosis from the healty ones.
+Now 
+
+Analyzing the loadings graph.
+
+```{r, warning=FALSE,message=FALSE}
+w = pls450$loading.weights
+c = pls450$Yloading[2,]
+
+data = rbind(w,c)
+rownames(data) = c(rownames(w),"ill")
+colnames(data) = c("p1","p2")
+data = as.data.frame(data)
+u1 = which(abs(data$p1)>0.095)
+u2 = which(abs(data$p2)>0.095)
+u = union(u1,u2)
+data2 = data[u,]
+data2 = rbind(data2,c)
+data2 = as.data.frame(data2)
+rownames(data2)[length(data2$p1)] = 'ill'
+
+data2 = data2 %>% mutate(type = as.factor(c(rep(1,nrow(data2)-1),2)))
+
+t <- list(
+  family = "sans serif",
+  size = 13,
+  color = toRGB("black"))
+
+p = plot_ly(data2, x=~p1, y=~p2, color=~type, colors = c("#48C1E5","#D20409"), showlegend = F, text = rownames(data2))
+p = p %>% add_markers(size=0.5) %>% add_segments(x = 0, xend = ~p1, y = 0, yend = ~p2)
+p1 = p %>% add_text(textfont = t, textposition = "bottom right") %>% layout(title = "Weights")
+p1
+
+```
+
+This graph will be useful, once we obtain the most influential species in the model, to be able to see how they are related to the predicted variable.
+
+Table with the most influent OTUs.
+
+```{r}
+otus <- vip(pls450)
+otus
+nombres <- otus$data$Variable
+otus2 <- as.data.frame(Datos_Taxa$Cirrosis[which(rownames(Datos_Taxa$Cirrosis) %in% nombres)])
+otus2
+```
+
+With this table we can observe the 10 most influential variables in the model according to their vip (The importance can be observed in the bar plot). It can be seen that the most influential species are 477, 570, 243 and 410.
+
+## TSS
+
+First model with all the variables.
+```{r}
+plstss = plsda(x=select(tss1Train,-disease), y=tss1Train$disease, ncomp = 2, type="prob", probMethod = "softmax")
+
+pred = predict(plstss, newdata=select(tss1Test,-disease), type="prob")
+pred = as.data.frame(pred)
+prediction = prediction(pred$ill,as.numeric(tss1Test$disease)-1)
+perf <- performance(prediction,"tpr","fpr")
+perf2 = performance(prediction,"auc")
+auc = as.numeric(perf2@y.values)
+plot(perf,colorize=TRUE)
+abline(a = 0, b = 1)
+text(0.6, 0.3, label = paste0("AUC ",round(auc,3)))
+
+pred2 = predict(plstss, newdata=select(tss1Test,-disease))
+F1_Score(tss1Test$disease, pred2)
+```
+
+Models trained with different cut-off points.
+
+```{r}
+resultados = data.frame()
+
+plsprobs = plsda(x=select(tss1Train,-disease), y=tss1Train$disease, type="prob", probMethod = "softmax")
+
+g = vip(plsprobs, num_features = 190)
+v = g$data$Variable
+
+for (i in 2:length(v)) {
+  otus = v[1:i]
+  newdata = as.data.frame(tss1Train[otus])
+  newdata$disease = tss1Train$disease
+  
+  #entrenamos los modelos con cv con las variables seleccionadas en base al auc y cogemos el mejor
+  tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+  model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+  c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+  
+  
+  #entrenamos el que mejor resultado nos da con todo el conjunto de train y predecimos el conjunto de test. Nos guardamos los resultados obtenidos
+  plsprobs = plsda(x=select(newdata,-disease), y=newdata$disease, ncomp = c, type="prob", probMethod = "softmax")
+  pred = predict(plsprobs, newdata=tss1Test[otus], type="prob")
+  pred = as.data.frame(pred)
+  colnames(pred) = c("healthy","ill")
+  prediction = prediction(pred$ill,tss1Test$disease)
+  perf = performance(prediction,"auc")
+  resultados = rbind(resultados, data.frame(importantOtus=i,ncomp=c,auc=as.numeric(perf@y.values)))
+
+
+}
+
+print(resultados)
+```
+
+The model with the highest auc is the model trained with 21 variables. Let's analyze this pls in depth.
+
+```{r}
+newdata = as.data.frame(tss1Train[v[1:21]])
+newdata$disease = tss1Train$disease
+tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+
+pls21 = plsda(x=tss1Train[v[1:21]], y=tss1Train$disease, ncomp = c, type="class", probMethod = "softmax")
+
+pred = predict(pls21, newdata=tss1Test[v[1:21]], type="prob")
+pred = as.data.frame(pred)
+
+pred2 <- predict(pls21, newdata = tss1Test[v[1:21]])
+f1 <- F1_Score(tss1Test$disease, pred2)
+print(f1)
+```
+
+The value of the F1 coefficient is also higher. Let's plot the scores to see how well this model separates sick individuals from healthy ones.
+
+```{r}
+#grafico scores
+scores = pls21$scores
+scores = data.frame("p1"=scores[,1],
+                    "p2"=scores[,2],
+                    "type"=tss1Train$disease)
+g1 = ggplot(scores, aes(p1,p2, color=type)) + geom_point(alpha = I(0.6)) + 
+     scale_color_manual(values = c("blue", "red"))
+g1
+```
+
+Loading plot
+
+```{r, warning=FALSE,message=FALSE}
+w = pls21$loading.weights
+c = pls21$Yloading[2,]
+
+data = rbind(w,c)
+rownames(data) = c(rownames(w),"ill")
+colnames(data) = c("p1","p2")
+data = as.data.frame(data)
+u1 = which(abs(data$p1)>0.075)
+u2 = which(abs(data$p2)>0.075)
+u = union(u1,u2)
+data2 = data[u,]
+data2 = rbind(data2,c)
+data2 = as.data.frame(data2)
+
+data2 = data2 %>% mutate(type = as.factor(c(rep(1,nrow(data2)-1),2)))
+
+t <- list(
+  family = "sans serif",
+  size = 13,
+  color = toRGB("black"))
+
+p = plot_ly(data2, x=~p1, y=~p2, color=~type, colors = c("#48C1E5","#D20409"), showlegend = F, text = rownames(data2))
+p = p %>% add_markers(size=0.5) %>% add_segments(x = 0, xend = ~p1, y = 0, yend = ~p2)
+p1 = p %>% add_text(textfont = t, textposition = "bottom right") %>% layout(title = "Weights")
+p1
+
+```
+
+
+Most influent variables
+
+```{r}
+otus <- vip(pls21)
+otus
+nombres <- otus$data$Variable
+otus2 <- as.data.frame(Datos_Taxa$Cirrosis[which(rownames(Datos_Taxa$Cirrosis) %in% nombres)])
+otus2
+```
+
+The first three OTUs with the most influence on the model are the same as in CLR training, but the order of the second and third OTUs is reversed.
+
+
+
+
+# S2 Filter Process
+
+## CLR 
+
+First model with all the variables.
+
+```{r pls.probs}
+plsinicial = plsda(x=select(clrTrain,-disease), y=clrTrain$disease, ncomp = 2, type="class", probMethod = "softmax")
+
+pred = predict(plsinicial, newdata=select(clrTest,-disease), type="prob")
+pred = as.data.frame(pred)
+colnames(pred) = c("healthy","ill")
+prediction = prediction(pred$ill,as.numeric(clrTest$disease)-1)
+perf <- performance(prediction,"tpr","fpr")
+perf2 = performance(prediction,"auc")
+auc = as.numeric(perf2@y.values)
+plot(perf,colorize=TRUE)
+abline(a = 0, b = 1)
+text(0.6, 0.3, label = paste0("AUC ",round(auc,3)))
+
+pred2 = predict(plsinicial, newdata=select(clrTest,-disease))
+F1_Score(clrTest$disease, pred2)
+```
+
+
+Models trained with different cut-off points.
+
+```{r}
+resultados = data.frame()
+
+plsprobs = plsda(x=select(clrTrain,-disease), y=clrTrain$disease, type="prob", probMethod = "softmax")
+
+g = vip(plsprobs, num_features = 190)
+v = g$data$Variable
+
+for (i in 2:length(v)) {
+  otus = v[1:i]
+  newdata = as.data.frame(clrTrain[otus])
+  newdata$disease = clrTrain$disease
+  
+  #entrenamos los modelos con cv con las variables seleccionadas en base al auc y cogemos el mejor
+  tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+  model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+  c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+  
+  
+  #entrenamos el que mejor resultado nos da con todo el conjunto de train y predecimos el conjunto de test. Nos guardamos los resultados obtenidos
+  plsprobs = plsda(x=select(newdata,-disease), y=newdata$disease, ncomp = c, type="prob", probMethod = "softmax")
+  pred = predict(plsprobs, newdata=clrTest[otus], type="prob")
+  pred = as.data.frame(pred)
+  colnames(pred) = c("healthy","ill")
+  prediction = prediction(pred$ill,clrTest$disease)
+  perf = performance(prediction,"auc")
+  resultados = rbind(resultados, data.frame(importantOtus=i,ncomp=c,auc=as.numeric(perf@y.values)))
+
+
+}
+
+print(resultados)
+```
+
+The model with the highest auc is the model trained with 143 variables. Let's analyze this pls in depth.
+
+
+```{r}
+newdata = as.data.frame(clrTrain[v[1:143]])
+newdata$disease = clrTrain$disease
+tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+
+pls143 = plsda(x=clrTrain[v[1:143]], y=clrTrain$disease, ncomp = c, type="class", probMethod = "softmax")
+
+pred = predict(pls143, newdata=clrTest[v[1:143]], type="prob")
+pred = as.data.frame(pred)
+
+pred2 <- predict(pls143, newdata = clrTest[v[1:143]])
+f1 <- F1_Score(clrTest$disease, pred2)
+print(f1)
+```
+
+The F1 score is the same as in the model trained with all species, but the AUC improves.
+
+Now we will plot the scores of this model to see if it separates well the individuals of the two classes.
+
+Scores plot
+
+```{r}
+scores = plsinicial$scores
+scores = data.frame("p1"=scores[,1],
+                    "p2"=scores[,2],
+                    "type"=clrTrain$disease)
+g1 = ggplot(scores, aes(p1,p2, color=type)) + geom_point(alpha = I(0.6)) + 
+     scale_color_manual(values = c("blue", "red"))
+g1
+
+```
+
+Loadings plot
+
+```{r, warning=FALSE,message=FALSE}
+w = plsprobs$loading.weights
+c = plsprobs$Yloading[2,]
+
+data = rbind(w,c)
+rownames(data) = c(rownames(w),"ill")
+colnames(data) = c("p1","p2")
+data = as.data.frame(data)
+u1 = which(abs(data$p1)>0.075)
+u2 = which(abs(data$p2)>0.075)
+u = union(u1,u2)
+data2 = data[u,]
+data2 = rbind(data2,c)
+data2 = as.data.frame(data2)
+
+data2 = data2 %>% mutate(type = as.factor(c(rep(1,nrow(data2)-1),2)))
+
+t <- list(
+  family = "sans serif",
+  size = 13,
+  color = toRGB("black"))
+
+p = plot_ly(data2, x=~p1, y=~p2, color=~type, colors = c("#48C1E5","#D20409"), showlegend = F, text = rownames(data2))
+p = p %>% add_markers(size=0.5) %>% add_segments(x = 0, xend = ~p1, y = 0, yend = ~p2)
+p1 = p %>% add_text(textfont = t, textposition = "bottom right") %>% layout(title = "Weights")
+p1
+
+```
+
+Most influent variables
+
+```{r}
+otus <- vip(plsprobs)
+otus
+nombres <- otus$data$Variable
+otus2 <- as.data.frame(Datos_Taxa$Cirrosis[which(rownames(Datos_Taxa$Cirrosis) %in% nombres)])
+otus2
+```
+
+The order of the importance of the OTUs is the same as in the CLR S1 preprocessing.
+
+
+
+
+## TSS
+
+First model with all the variables.
+
+```{r pls.probs}
+plstss = plsda(x=select(tssTrain,-disease), y=tssTrain$disease, ncomp = 2, type="prob", probMethod = "softmax")
+
+pred = predict(plstss, newdata=select(tssTest,-disease), type="prob")
+pred = as.data.frame(pred)
+prediction = prediction(pred$ill,as.numeric(tssTest$disease)-1)
+perf <- performance(prediction,"tpr","fpr")
+perf2 = performance(prediction,"auc")
+auc = as.numeric(perf2@y.values)
+plot(perf,colorize=TRUE)
+abline(a = 0, b = 1)
+text(0.6, 0.3, label = paste0("AUC ",round(auc,3)))
+
+pred2 = predict(plstss, newdata=select(tssTest,-disease))
+F1_Score(tssTest$disease, pred2)
+```
+This model returns an AUC of 0.87 and an f1 score of 0.807.
+
+
+
+```{r}
+resultados = data.frame()
+
+plsprobs = plsda(x=select(tssTrain,-disease), y=tssTrain$disease, ncomp = 2, type="prob", probMethod = "softmax")
+
+g = vip(plsprobs, num_features = 190)
+v = g$data$Variable
+
+for (i in 2:length(v)) {
+  otus = v[1:i]
+  newdata = as.data.frame(tssTrain[otus])
+  newdata$disease = tssTrain$disease
+  
+  #entrenamos los modelos con cv con las variables seleccionadas en base al auc y cogemos el mejor
+  tr_fit = trainControl(method= 'repeatedcv',number = 10, repeats = 10, classProbs = TRUE,summaryFunction = twoClassSummary)
+  model = train(disease~., data=newdata, trControl = tr_fit,method = 'pls',metric = 'ROC')
+  c = model$results$ncomp[which(model$results$ROC==max(model$results$ROC))]
+  
+  
+  #entrenamos el que mejor resultado nos da con todo el conjunto de train y predecimos el conjunto de test. Nos guardamos los resultados obtenidos
+  plsprobs = plsda(x=select(newdata,-disease), y=newdata$disease, ncomp = c, type="prob", probMethod = "softmax")
+  pred = predict(plsprobs, newdata=tssTest[otus], type="prob")
+  pred = as.data.frame(pred)
+  colnames(pred) = c("healthy","ill")
+  prediction = prediction(pred$ill,as.numeric(tssTest$disease)-1)
+  perf <- performance(prediction,"tpr","fpr")
+  perf2 = performance(prediction,"auc")
+  resultados = rbind(resultados, data.frame(importantOtus=i,ncomp=c,auc=as.numeric(perf2@y.values)))
+
+
+}
+
+print(resultados)
+```
+
+The model with the highest AUC is the one that includes 16 outs.
+
+
+```{r pls.probs}
+
+pls16 = plsda(x=tssTrain[v[1:16]], y=tssTrain$disease, ncomp = 2, type="class", probMethod = "softmax")
+
+pred = predict(pls16, newdata=tssTest[v[1:16]], type="prob")
+pred = as.data.frame(pred)
+colnames(pred) = c("healthy","ill")
+prediction = prediction(pred$ill,as.numeric(tssTest$disease)-1)
+perf <- performance(prediction,"tpr","fpr")
+perf2 = performance(prediction,"auc")
+auc = as.numeric(perf2@y.values)
+
+pred2 = predict(pls16, newdata=tssTest[v[1:16]])
+F1_Score(tssTest$disease, pred2)
+```
+
+The f1 now is 0.816, slightly higher than that obtained in the other model.
+
+Scores plot
+```{r}
+scores = pls16$scores
+scores = data.frame("p1"=scores[,1], "p2"=scores[,2],
+                    "type"=tssTrain$disease)
+g1 = ggplot(scores, aes(p1,p2, color=type)) + geom_point(alpha = I(0.5)) + 
+     scale_color_manual(values = c("#00AFBB", "#FC4E07"))
+g1
+```
+
+Loadings plot
+```{r, warning=FALSE,message=FALSE}
+w = pls16$loading.weights
+c = pls16$Yloading[2,]
+
+data = rbind(w,c)
+rownames(data) = c(rownames(w),"ill")
+colnames(data) = c("p1","p2")
+data = as.data.frame(data)
+data = data %>% mutate(type = as.factor(c(rep(1,nrow(data)-1),2)))
+
+t <- list(
+  family = "sans serif",
+  size = 13,
+  color = toRGB("black"))
+
+p = plot_ly(data, x=~p1, y=~p2, color=~type, colors = c("#48C1E5","#D20409"), showlegend = F, text = rownames(data))
+p = p %>% add_markers(size=0.5) %>% add_segments(x = 0, xend = ~p1, y = 0, yend = ~p2)
+p1 = p %>% add_text(textfont = t, textposition = "top") %>% layout(title = "Weights")
+p1
+```
+
+Most influent variables
+
+```{r}
+otus <- vip(pls16)
+otus
+nombres <- otus$data$Variable
+otus2 <- as.data.frame(Datos_Taxa$Cirrosis[which(rownames(Datos_Taxa$Cirrosis) %in% nombres)])
+otus2
+```
+
+This time, the order of importance of the OTUs is the same as in the TSS S2 preprocessing.
+
+To conclude this appendix, it should be noted that the model that obtained the best results was the one trained with 450 variables on the CLR S1 preprocessing. In general, the CLR transformation gives higher AUC and f1-score values. The most important species for distinguishing between sick and healthy individuals are the same in all models, but between S1 and S2 the order of importance changes.
+
+
+
